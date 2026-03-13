@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kamel jumpbox access stack for dev and prod environments
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+
+  JumpboxInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the SSM-managed jumpbox
+
+  JumpboxKeyName:
+    Type: String
+    Default: ""
+    Description: Optional EC2 key pair name if SSH access is ever needed
+
+  ScheduleTimezone:
+    Type: String
+    Default: Asia/Kolkata
+    Description: Time zone for the weekday start and stop schedules
+
+  StartScheduleExpression:
+    Type: String
+    Default: cron(30 9 ? * MON-FRI *)
+    Description: Start the jumpbox at 9:30 AM on weekdays
+
+  StopScheduleExpression:
+    Type: String
+    Default: cron(30 18 ? * MON-FRI *)
+    Description: Stop the jumpbox at 6:30 PM on weekdays
+
+Mappings:
+  EnvConfig:
+    dev:
+      VolumeSize: 8
+    prod:
+      VolumeSize: 8
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref JumpboxKeyName, ""]]
+
+Resources:
+  JumpboxRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: kamel-access
+        - Key: Role
+          Value: jumpbox
+
+  JumpboxInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref JumpboxRole
+
+  JumpboxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref JumpboxInstanceProfile
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      InstanceType: !Ref JumpboxInstanceType
+      KeyName: !If [HasKeyPair, !Ref JumpboxKeyName, !Ref AWS::NoValue]
+      SubnetId:
+        Fn::ImportValue: !Sub KamelPrivateSubnet1-${Environment}
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub KamelJumpboxSG-${Environment}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: !FindInMap [EnvConfig, !Ref Environment, VolumeSize]
+            VolumeType: gp3
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      Monitoring: false
+      PropagateTagsToVolumeOnCreation: true
+      DisableApiTermination: false
+      InstanceInitiatedShutdownBehavior: stop
+      Tags:
+        - Key: Name
+          Value: !Sub kamel-jumpbox-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: kamel-access
+        - Key: Role
+          Value: jumpbox
+
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStopJumpbox
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${JumpboxInstance}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: kamel-access
+
+  StartJumpboxWeekdays:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Start the Kamel jumpbox on weekdays
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref StartScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub |
+          {
+            "InstanceIds": ["${JumpboxInstance}"]
+          }
+      Name: !Sub kamel-jumpbox-start-${Environment}
+
+  StopJumpboxWeekdays:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Stop the Kamel jumpbox on weekdays
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref StopScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub |
+          {
+            "InstanceIds": ["${JumpboxInstance}"]
+          }
+      Name: !Sub kamel-jumpbox-stop-${Environment}
+
+Outputs:
+  JumpboxInstanceId:
+    Description: EC2 jumpbox instance ID
+    Value: !Ref JumpboxInstance
+    Export:
+      Name: !Sub KamelJumpboxInstanceId-${Environment}
+
+  JumpboxPrivateIp:
+    Description: EC2 jumpbox private IP address
+    Value: !GetAtt JumpboxInstance.PrivateIp
+    Export:
+      Name: !Sub KamelJumpboxPrivateIp-${Environment}
+
+  StartScheduleName:
+    Description: Weekday start schedule name
+    Value: !Ref StartJumpboxWeekdays
+
+  StopScheduleName:
+    Description: Weekday stop schedule name
+    Value: !Ref StopJumpboxWeekdays

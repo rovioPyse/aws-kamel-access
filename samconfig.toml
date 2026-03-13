@@ -12,7 +12,7 @@ profile = "aws-kamel"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 fail_on_empty_changeset = false
-disable_rollback = true
+disable_rollback = false
 parameter_overrides = "Environment=dev"
 
 [prod.deploy.parameters]

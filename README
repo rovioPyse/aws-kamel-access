@@ -1,84 +1,51 @@
-# aws-kamel-auth
+# Kamel Access Stack
 
-Shared authentication stack for the Kamel platform.
+This repository contains the jumpbox access layer for the Kamel platform.
 
-This stack owns the shared Amazon Cognito resources used by the app stacks. It is intentionally separate from the network and data stacks so identity changes can be managed independently.
+It deploys one private EC2 jumpbox per environment, managed through AWS Systems Manager Session Manager. The jumpbox lives in the shared VPC created by `aws-kamel-network` and can reach the private Aurora cluster created by `aws-kamel-data`.
 
 ## What This Stack Creates
 
-- One Cognito user pool shared across the platform
-- Three Cognito app clients:
-  - `admin-client`
-  - `assembly-client`
-  - `service-client`
-- Three Cognito groups:
-  - `admin`
-  - `assembly_user`
-  - `service_user`
+- One EC2 jumpbox per environment
+- An IAM role and instance profile for Systems Manager
+- Weekday EventBridge Scheduler rules to start and stop the jumpbox
+- CloudFormation exports for the jumpbox instance ID and private IP
 
-## Auth Model
+## Prerequisites
 
-This stack is configured for custom frontend login screens.
+Deploy these stacks first for the same environment:
 
-The intended flow is:
+- `aws-kamel-network`
+- `aws-kamel-data`
 
-1. A frontend app shows its own login UI.
-2. The frontend authenticates directly against Cognito using the app client for that app.
-3. Cognito returns ID, access, and refresh tokens.
-4. The frontend stores the tokens and sends the access token to backend APIs in the `Authorization` header.
-5. API Gateway and/or Lambda validates the JWT.
-6. Backend code enforces business authorization using Cognito group claims and application rules.
+This stack imports:
 
-This stack does not configure Cognito Hosted UI or OAuth callback/logout URLs.
+- `KamelPrivateSubnet1-${Environment}`
+- `KamelJumpboxSG-${Environment}`
 
-## User Model
+The network stack must also include the SSM-related VPC endpoints:
 
-- All users live in one shared user pool.
-- Users are created by admins, not by self-signup.
-- Group membership is used for coarse role control.
-- A user can belong to more than one group.
+- `ssm`
+- `ssmmessages`
+- `ec2messages`
 
-## Environment Behavior
+## Behavior
 
-### dev
+- The jumpbox is private only. There is no public IP.
+- Access is through Systems Manager Session Manager.
+- The scheduler starts the jumpbox on weekdays at `9:30 AM` and stops it at `6:30 PM` in `Asia/Kolkata`.
+- The same scheduler behavior currently applies to both `dev` and `prod`, matching the current template.
 
-- User pool deletion protection is disabled
-- MFA is off
-- Token validity:
-  - access token: 60 minutes
-  - ID token: 60 minutes
-  - refresh token: 30 days
+## Parameters
 
-### prod
-
-- User pool deletion protection is enabled
-- MFA is optional with software token MFA enabled
-- Token validity:
-  - access token: 60 minutes
-  - ID token: 60 minutes
-  - refresh token: 30 days
-
-## Stack Outputs
-
-The stack exports values for app stacks to import:
-
-- `KamelUserPoolId-${Environment}`
-- `KamelUserPoolArn-${Environment}`
-- `KamelIssuerUrl-${Environment}`
-- `KamelJwksUrl-${Environment}`
-- `KamelAdminAppClientId-${Environment}`
-- `KamelAssemblyAppClientId-${Environment}`
-- `KamelServiceAppClientId-${Environment}`
-- `KamelAdminGroup-${Environment}`
-- `KamelAssemblyGroup-${Environment}`
-- `KamelServiceGroup-${Environment}`
+- `Environment`: `dev` or `prod`
+- `JumpboxInstanceType`: defaults to `t3.micro`
+- `JumpboxKeyName`: optional EC2 key pair name
+- `ScheduleTimezone`: defaults to `Asia/Kolkata`
+- `StartScheduleExpression`: defaults to `cron(30 9 ? * MON-FRI *)`
+- `StopScheduleExpression`: defaults to `cron(30 18 ? * MON-FRI *)`
 
 ## Deployment
-
-`samconfig.toml` defines two environments:
-
-- `dev`
-- `prod`
 
 Examples:
 
@@ -89,7 +56,6 @@ sam deploy --config-env prod
 
 ## Notes
 
-- This stack only manages shared identity resources.
-- App-specific API authorizers are expected to live in the individual app stacks.
-- Backend services should still perform authorization checks based on group claims and business rules.
-- Database authorization remains separate from Cognito and should be enforced with per-service database roles.
+- `t3.micro` is a reasonable low-cost default, but free-tier eligibility depends on your AWS account and region.
+- The jumpbox schedule affects EC2 only. Aurora auto-pause remains managed in `aws-kamel-data`.
+- If you use Session Manager port forwarding to reach Aurora from your laptop, the jumpbox must be running.
