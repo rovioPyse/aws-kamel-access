@@ -1,61 +1,307 @@
 # Kamel Access Stack
 
-This repository contains the jumpbox access layer for the Kamel platform.
+This repository defines the jumpbox access infrastructure for Kamel environments using AWS SAM and CloudFormation.
 
-It deploys one private EC2 jumpbox per environment, managed through AWS Systems Manager Session Manager. The jumpbox lives in the shared VPC created by `aws-kamel-network` and can reach the private Aurora cluster created by `aws-kamel-data`.
+The stack deploys a private EC2 jumpbox per environment and manages its operating window with EventBridge Scheduler. The jumpbox is intended to be accessed through AWS Systems Manager Session Manager rather than through a public IP.
 
-## What This Stack Creates
+## Purpose
 
-- One EC2 jumpbox per environment
-- An IAM role and instance profile for Systems Manager
-- Weekday EventBridge Scheduler rules to start and stop the jumpbox
-- CloudFormation exports for the jumpbox instance ID and private IP
+`aws-kamel-access` provides operational access infrastructure for:
 
-## Prerequisites
+- `dev`
+- `prod`
 
-Deploy these stacks first for the same environment:
+It creates a private administration host inside the shared VPC so operators can reach private resources, such as Aurora, without exposing those resources publicly.
 
-- `aws-kamel-network`
-- `aws-kamel-data`
+## Template Overview
 
-This stack imports:
+The infrastructure is defined in [`template.yaml`](/d:/Kamel/aws-kamel-access/template.yaml).
+
+### Parameters
+
+The template accepts the following parameters:
+
+- `Environment`: required, allowed values `dev` and `prod`
+- `JumpboxInstanceType`: optional, default `t3.micro`
+- `JumpboxKeyName`: optional EC2 key pair name, default empty
+- `ScheduleTimezone`: optional, default `Asia/Kolkata`
+- `StartScheduleExpression`: optional, default `cron(30 9 ? * MON-FRI *)`
+- `StopScheduleExpression`: optional, default `cron(30 18 ? * MON-FRI *)`
+
+### Conditions
+
+The template defines one condition:
+
+- `HasKeyPair`: true when `JumpboxKeyName` is provided
+
+### Environment-Specific Configuration
+
+Environment settings are stored in the `EnvConfig` mapping.
+
+| Setting | `dev` | `prod` |
+| --- | --- | --- |
+| Root volume size | `8` GiB | `8` GiB |
+
+## Dependencies
+
+This stack depends on exports from `aws-kamel-network`.
+
+Required imports:
 
 - `KamelPrivateSubnet1-${Environment}`
 - `KamelJumpboxSG-${Environment}`
 
-The network stack must also include the SSM-related VPC endpoints:
+Operationally, the target VPC also needs the Systems Manager-related interface endpoints already created by the network stack:
 
 - `ssm`
 - `ssmmessages`
 - `ec2messages`
 
-## Behavior
+Although this stack does not directly import from `aws-kamel-data`, it is intended to complement that stack by providing private operational access to resources such as Aurora.
 
-- The jumpbox is private only. There is no public IP.
-- Access is through Systems Manager Session Manager.
-- The scheduler starts the jumpbox on weekdays at `9:30 AM` and stops it at `6:30 PM` in `Asia/Kolkata`.
-- The same scheduler behavior currently applies to both `dev` and `prod`, matching the current template.
+## What Gets Created
 
-## Parameters
+For each environment deployment, the stack creates:
 
-- `Environment`: `dev` or `prod`
-- `JumpboxInstanceType`: defaults to `t3.micro`
-- `JumpboxKeyName`: optional EC2 key pair name
-- `ScheduleTimezone`: defaults to `Asia/Kolkata`
-- `StartScheduleExpression`: defaults to `cron(30 9 ? * MON-FRI *)`
-- `StopScheduleExpression`: defaults to `cron(30 18 ? * MON-FRI *)`
+- 1 IAM role for the jumpbox EC2 instance
+- 1 IAM instance profile
+- 1 private EC2 jumpbox instance
+- 1 IAM role for EventBridge Scheduler
+- 2 EventBridge Scheduler schedules
+- 2 exported CloudFormation outputs
+- 2 non-exported stack outputs for schedule names
 
-## Deployment
+## Jumpbox Instance
 
-Examples:
+The stack creates a single EC2 instance named:
+
+- `kamel-jumpbox-${Environment}`
+
+### Placement And Connectivity
+
+The jumpbox is launched in:
+
+- `KamelPrivateSubnet1-${Environment}`
+
+It uses the imported security group:
+
+- `KamelJumpboxSG-${Environment}`
+
+Key connectivity behavior:
+
+- no public IP is configured in this template
+- the instance is intended to be managed through Systems Manager Session Manager
+- the instance can reach private resources allowed by the jumpbox security group and route configuration
+
+### AMI And Instance Type
+
+The instance uses the latest Amazon Linux 2023 x86_64 AMI resolved through SSM:
+
+- `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`
+
+The default instance type is:
+
+- `t3.micro`
+
+### Storage Configuration
+
+The root volume is configured as:
+
+- device name `/dev/xvda`
+- `gp3`
+- encrypted
+- deleted on termination
+- `8` GiB in both environments
+
+### Instance Security And Behavior
+
+The EC2 instance is configured with:
+
+- IMDS enabled
+- IMDSv2 required via `HttpTokens: required`
+- detailed monitoring disabled
+- tag propagation to volumes enabled
+- API termination protection disabled
+- `InstanceInitiatedShutdownBehavior: stop`
+
+If `JumpboxKeyName` is provided, the EC2 key pair is attached to the instance. If it is not provided, no key pair is set.
+
+## IAM Resources
+
+### Jumpbox Role
+
+The stack creates `JumpboxRole` for the EC2 instance.
+
+Behavior:
+
+- assumed by `ec2.amazonaws.com`
+- attaches the managed policy `AmazonSSMManagedInstanceCore`
+
+This gives the instance the permissions needed to register with Systems Manager and be accessed through Session Manager.
+
+### Jumpbox Instance Profile
+
+The stack creates `JumpboxInstanceProfile` and attaches `JumpboxRole` to it for use by the EC2 instance.
+
+### Scheduler Execution Role
+
+The stack creates `SchedulerExecutionRole` for EventBridge Scheduler.
+
+Behavior:
+
+- assumed by `scheduler.amazonaws.com`
+- includes an inline policy allowing:
+  - `ec2:StartInstances`
+  - `ec2:StopInstances`
+- permissions are scoped to the jumpbox EC2 instance ARN
+
+Because this stack defines IAM resources, deployment requires `CAPABILITY_IAM`.
+
+## Scheduler Configuration
+
+The stack creates two EventBridge Scheduler schedules:
+
+- `StartJumpboxWeekdays`
+- `StopJumpboxWeekdays`
+
+Schedule names:
+
+- `kamel-jumpbox-start-${Environment}`
+- `kamel-jumpbox-stop-${Environment}`
+
+Default scheduling behavior:
+
+- start at `9:30 AM` Monday through Friday
+- stop at `6:30 PM` Monday through Friday
+- time zone `Asia/Kolkata`
+- flexible time window disabled
+- schedule state enabled
+
+The schedules invoke AWS SDK targets through EventBridge Scheduler:
+
+- `ec2:startInstances`
+- `ec2:stopInstances`
+
+The scheduler input targets the single EC2 instance created by this stack.
+
+## Access Model
+
+The intended operational model is:
+
+1. The weekday start schedule powers on the jumpbox.
+2. An operator connects through AWS Systems Manager Session Manager.
+3. The operator uses the private jumpbox to reach internal resources such as Aurora.
+4. The weekday stop schedule powers the jumpbox off outside working hours.
+
+This stack does not create:
+
+- a public IP
+- an Elastic IP
+- inbound SSH rules
+- a bastion exposed to the internet
+
+## Deployment Configuration
+
+The checked-in deployment defaults live in [`samconfig.toml`](/d:/Kamel/aws-kamel-access/samconfig.toml).
+
+Current defaults:
+
+- Region: `ap-south-1`
+- AWS profile: `aws-kamel`
+- Stack names:
+  - `kamel-access-dev`
+  - `kamel-access-prod`
+- Parameter overrides:
+  - `Environment=dev`
+  - `Environment=prod`
+
+## How To Validate
+
+Run:
+
+```powershell
+sam validate --lint
+```
+
+## How To Deploy
+
+Deploy `dev`:
 
 ```powershell
 sam deploy --config-env dev
+```
+
+Deploy `prod`:
+
+```powershell
 sam deploy --config-env prod
 ```
 
-## Notes
+Override the instance type or schedule when needed:
 
-- `t3.micro` is a reasonable low-cost default, but free-tier eligibility depends on your AWS account and region.
-- The jumpbox schedule affects EC2 only. Aurora auto-pause remains managed in `aws-kamel-data`.
-- If you use Session Manager port forwarding to reach Aurora from your laptop, the jumpbox must be running.
+```powershell
+sam deploy --config-env dev --parameter-overrides "Environment=dev JumpboxInstanceType=t3.small ScheduleTimezone=Asia/Kolkata"
+```
+
+Provide an EC2 key pair when needed:
+
+```powershell
+sam deploy --config-env dev --parameter-overrides "Environment=dev JumpboxKeyName=my-keypair"
+```
+
+## Rollback Behavior
+
+Environment deployment behavior is configured as follows:
+
+- `dev`: `disable_rollback = false`
+- `prod`: `on_failure = "ROLLBACK"`
+
+In practice:
+
+- `dev` uses the default rollback behavior
+- `prod` explicitly rolls back failed stack creation
+
+## CloudFormation Outputs
+
+The stack returns the following outputs:
+
+### Exported Outputs
+
+- `KamelJumpboxInstanceId-${Environment}`
+- `KamelJumpboxPrivateIp-${Environment}`
+
+### Non-Exported Outputs
+
+- `StartScheduleName`
+- `StopScheduleName`
+
+The schedule names are output by the stack but are not exported through `Export` blocks.
+
+## Downstream Usage
+
+Typical consumers of this stack will use:
+
+- the jumpbox instance ID for operations or automation
+- the private IP for internal documentation or administrative workflows
+
+Example import pattern:
+
+```yaml
+JumpboxInstanceId: !ImportValue KamelJumpboxInstanceId-dev
+JumpboxPrivateIp: !ImportValue KamelJumpboxPrivateIp-dev
+```
+
+## Operational Notes
+
+- This stack depends on the network stack exports and will fail if they are missing.
+- Systems Manager connectivity requires the SSM-related VPC endpoints to exist and function in the shared VPC.
+- The jumpbox is private only and is not reachable directly from the public internet.
+- The scheduler affects only the EC2 instance and does not control Aurora or other application resources.
+- If you use Session Manager port forwarding to reach Aurora from your workstation, the jumpbox must be running.
+- `t3.micro` is a small and low-cost default, but actual cost and eligibility depend on account and region.
+
+## Repository Files
+
+- [`template.yaml`](/d:/Kamel/aws-kamel-access/template.yaml): main infrastructure definition
+- [`samconfig.toml`](/d:/Kamel/aws-kamel-access/samconfig.toml): deployment defaults for `dev` and `prod`
+- [`README`](/d:/Kamel/aws-kamel-access/README): repository documentation
