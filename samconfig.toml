@@ -1,0 +1,28 @@
+version = 0.1
+
+[default.global.parameters]
+template_file = "template.yaml"
+
+[dev.deploy.parameters]
+stack_name = "kamel-access-dev"
+resolve_s3 = true
+s3_prefix = "kamel-access/dev"
+region = "ap-south-1"
+profile = "aws-kamel"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+disable_rollback = true
+parameter_overrides = "Environment=dev"
+
+[prod.deploy.parameters]
+stack_name = "kamel-access-prod"
+resolve_s3 = true
+s3_prefix = "kamel-access/prod"
+region = "ap-south-1"
+profile = "aws-kamel"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+on_failure = "ROLLBACK"
+parameter_overrides = "Environment=prod"
